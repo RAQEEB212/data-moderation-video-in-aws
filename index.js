@@ -1,9 +1,16 @@
+import multer from "multer";
+import fs from "fs";
+import express from "express";
+import cors from "cors";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { readFileSync } from "fs";
+import path from "path";
 import { CreateQueueCommand, GetQueueAttributesCommand, GetQueueUrlCommand,
     SetQueueAttributesCommand, DeleteQueueCommand, ReceiveMessageCommand, DeleteMessageCommand } from  "@aws-sdk/client-sqs";
 import {CreateTopicCommand, SubscribeCommand, DeleteTopicCommand } from "@aws-sdk/client-sns";
 import  { SQSClient } from "@aws-sdk/client-sqs";
 import  { SNSClient } from "@aws-sdk/client-sns";
-import  { RekognitionClient, StartLabelDetectionCommand, GetLabelDetectionCommand } from "@aws-sdk/client-rekognition";
+import  { RekognitionClient, StartContentModerationCommand, GetContentModerationCommand } from "@aws-sdk/client-rekognition";
 import { stdout } from "process";
 import {fromIni} from '@aws-sdk/credential-providers';
 
@@ -19,9 +26,14 @@ const rekClient = new RekognitionClient({region: REGION,
     credentials: fromIni({profile: profileName,}),
 });
 
+const s3Client = new S3Client({
+    region: REGION,
+    credentials: fromIni({ profile: profileName }),
+});
+
 // Set bucket and video variables
 const bucket = "video-moderation-sahoolat";
-const videoName = "your-video.mp4";
+const videoName = "videoo.mp4";
 const roleArn = "arn:aws:iam::067663914367:role/RekognitionSnsCustomRole";
 var startJobId = "";
 
@@ -84,70 +96,52 @@ const createTopicandQueue = async () => {
     }
 };
 
-const startLabelDetection = async (roleArn, snsTopicArn) => {
+const startModerationDetection = async (roleArn, snsTopicArn) => {
     try {
-        //Initiate label detection and update value of startJobId with returned Job ID
-        const labelDetectionResponse = await rekClient.send(new StartLabelDetectionCommand({Video:{S3Object:{Bucket:bucket, Name:videoName}},
-            NotificationChannel:{RoleArn: roleArn, SNSTopicArn: snsTopicArn}}));
-        startJobId = labelDetectionResponse.JobId
-        console.log(`JobID: ${startJobId}`)
-        return startJobId
+        const response = await rekClient.send(
+            new StartContentModerationCommand({
+                Video: { S3Object: { Bucket: bucket, Name: videoName } },
+                NotificationChannel: { RoleArn: roleArn, SNSTopicArn: snsTopicArn },
+            })
+        );
+        startJobId = response.JobId;
+        console.log(`Moderation JobID: ${startJobId}`);
+        return startJobId;
     } catch (err) {
-        console.log("Error", err);
+        console.error("Error starting content moderation:", err);
     }
 };
 
-const getLabelDetectionResults = async(startJobId) => {
-    console.log("Retrieving Label Detection results")
-    // Set max results, paginationToken and finished will be updated depending on response values
-    var maxResults = 10
-    var paginationToken = ''
-    var finished = false
+const getModerationResults = async (jobId) => {
+    console.log("Fetching moderation results...");
+    let paginationToken = '';
+    let finished = false;
 
-    // Begin retrieving label detection results
-    while (finished == false){
-        var response = await rekClient.send(new GetLabelDetectionCommand({JobId: startJobId, MaxResults: maxResults,
-            NextToken: paginationToken, SortBy:'TIMESTAMP'}))
-        // Log metadata
-        console.log(`Codec: ${response.VideoMetadata.Codec}`)
-        console.log(`Duration: ${response.VideoMetadata.DurationMillis}`)
-        console.log(`Format: ${response.VideoMetadata.Format}`)
-        console.log(`Frame Rate: ${response.VideoMetadata.FrameRate}`)
-        console.log()
-        // For every detected label, log label, confidence, bounding box, and timestamp
-        response.Labels.forEach(labelDetection => {
-            var label = labelDetection.Label
-            console.log(`Timestamp: ${labelDetection.Timestamp}`)
-            console.log(`Label: ${label.Name}`)
-            console.log(`Confidence: ${label.Confidence}`)
-            console.log("Instances:")
-            label.Instances.forEach(instance =>{
-                console.log(`Confidence: ${instance.Confidence}`)
-                console.log("Bounding Box:")
-                console.log(`Top: ${instance.Confidence}`)
-                console.log(`Left: ${instance.Confidence}`)
-                console.log(`Width: ${instance.Confidence}`)
-                console.log(`Height: ${instance.Confidence}`)
-                console.log()
+    while (!finished) {
+        const response = await rekClient.send(
+            new GetContentModerationCommand({
+                JobId: jobId,
+                NextToken: paginationToken,
+                SortBy: "TIMESTAMP",
+                MaxResults: 10,
             })
-            console.log()
-            // Log parent if found
-            console.log("   Parents:")
-            label.Parents.forEach(parent =>{
-                console.log(`    ${parent.Name}`)
-            })
-            console.log()
-            // Searh for pagination token, if found, set variable to next token
-            if (String(response).includes("NextToken")){
-                paginationToken = response.NextToken
+        );
 
-            }else{
-                finished = true
-            }
+        response.ModerationLabels.forEach((label) => {
+            console.log(`Timestamp: ${label.Timestamp}`);
+            console.log(`Confidence: ${label.ModerationLabel.Confidence}`);
+            console.log(`Name: ${label.ModerationLabel.Name}`);
+            console.log(`ParentName: ${label.ModerationLabel.ParentName}`);
+            console.log();
+        });
 
-        })
+        if (response.NextToken) {
+            paginationToken = response.NextToken;
+        } else {
+            finished = true;
+        }
     }
-}
+};
 
 // Checks for status of job completion
 const getSQSMessageSuccess = async(sqsQueueUrl, startJobId) => {
@@ -211,12 +205,10 @@ const getSQSMessageSuccess = async(sqsQueueUrl, startJobId) => {
 const runLabelDetectionAndGetResults = async () => {
     try {
         const sqsAndTopic = await createTopicandQueue();
-        const startLabelDetectionRes = await startLabelDetection(roleArn, sqsAndTopic[1]);
-        const getSQSMessageStatus = await getSQSMessageSuccess(sqsAndTopic[0], startLabelDetectionRes)
-        console.log(getSQSMessageSuccess)
-        if (getSQSMessageSuccess){
-            console.log("Retrieving results:")
-            const results = await getLabelDetectionResults(startLabelDetectionRes)
+        const startModerationRes = await startModerationDetection(roleArn, sqsAndTopic[1]);
+        const getSQSMessageStatus = await getSQSMessageSuccess(sqsAndTopic[0], startModerationRes);
+        if (getSQSMessageStatus) {
+            await getModerationResults(startModerationRes);
         }
         const deleteQueue = await sqsClient.send(new DeleteQueueCommand({QueueUrl: sqsAndTopic[0]}));
         const deleteTopic = await snsClient.send(new DeleteTopicCommand({TopicArn: sqsAndTopic[1]}));
@@ -226,4 +218,140 @@ const runLabelDetectionAndGetResults = async () => {
     }
 };
 
-runLabelDetectionAndGetResults()
+const uploadVideoToS3 = async () => {
+    const filePath = path.resolve("video-sample.mp4"); // Adjust filename if needed
+    const fileContent = readFileSync(filePath);
+
+    const uploadParams = {
+        Bucket: bucket,
+        Key: videoName,
+        Body: fileContent,
+        ContentType: "video/mp4"
+    };
+
+    try {
+        const uploadResult = await s3Client.send(new PutObjectCommand(uploadParams));
+        console.log("✅ Video uploaded to S3 successfully.");
+    } catch (err) {
+        console.error("❌ Error uploading video to S3:", err);
+        throw err;
+    }
+};
+
+const runEverything = async () => {
+    await uploadVideoToS3();
+    await runLabelDetectionAndGetResults();
+};
+
+// Express server setup
+const app = express();
+app.use(cors());
+app.use(express.json());
+const upload = multer({ dest: "uploads/" });
+const PORT = 3000;
+
+// API endpoint to trigger video analysis
+app.post("/analyze", async (req, res) => {
+    try {
+        await uploadVideoToS3();
+        await runLabelDetectionAndGetResults();
+        res.status(200).json({ message: "Video analysis started and completed. Check logs for details." });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to process video." });
+    }
+});
+
+app.post("/upload-analyze", upload.single("video"), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: "No video file uploaded." });
+        }
+
+        // Read the uploaded file
+        const filePath = req.file.path;
+        const fileContent = fs.readFileSync(filePath);
+
+        const uploadParams = {
+            Bucket: bucket,
+            Key: videoName,
+            Body: fileContent,
+            ContentType: "video/mp4"
+        };
+
+        await s3Client.send(new PutObjectCommand(uploadParams));
+        console.log("✅ Uploaded video from POST request to S3.");
+
+        // --- Moderation and verdict logic ---
+        const sqsAndTopic = await createTopicandQueue();
+        const startModerationRes = await startModerationDetection(roleArn, sqsAndTopic[1]);
+        const getSQSMessageStatus = await getSQSMessageSuccess(sqsAndTopic[0], startModerationRes);
+        let unsafeFindings = [];
+
+        if (getSQSMessageStatus) {
+            let paginationToken = '';
+            let finished = false;
+
+            while (!finished) {
+                const response = await rekClient.send(
+                    new GetContentModerationCommand({
+                        JobId: startModerationRes,
+                        NextToken: paginationToken,
+                        SortBy: "TIMESTAMP",
+                        MaxResults: 10,
+                    })
+                );
+
+                const UNSAFE_LABELS = [
+                    "Explicit Nudity", "Nudity", "Sexual Activity",
+                    "Violence", "Physical Abuse", "Gore", "Drugs",
+                    "Drinking", "Smoking", "Hate Symbols"
+                ];
+                const MIN_CONFIDENCE = 70;
+
+                response.ModerationLabels.forEach((label) => {
+                    const name = label.ModerationLabel.Name;
+                    const confidence = label.ModerationLabel.Confidence;
+
+                    if (UNSAFE_LABELS.includes(name) && confidence >= MIN_CONFIDENCE) {
+                        unsafeFindings.push({ name, confidence, timestamp: label.Timestamp });
+                    }
+                });
+
+                if (response.NextToken) {
+                    paginationToken = response.NextToken;
+                } else {
+                    finished = true;
+                }
+            }
+        }
+
+        fs.unlinkSync(filePath); // cleanup local temp file
+        await sqsClient.send(new DeleteQueueCommand({QueueUrl: sqsAndTopic[0]}));
+        await snsClient.send(new DeleteTopicCommand({TopicArn: sqsAndTopic[1]}));
+        console.log("Successfully deleted.");
+
+        if (unsafeFindings.length > 0) {
+            return res.status(200).json({
+                verdict: "Unsafe",
+                reasons: unsafeFindings,
+                message: "This video contains content that is not allowed on the website."
+            });
+        } else {
+            return res.status(200).json({
+                verdict: "Safe",
+                message: "This video is safe to display."
+            });
+        }
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Failed to upload and analyze video." });
+    }
+});
+
+app.listen(PORT, () => {
+    console.log(`🚀 Server running on http://localhost:${PORT}`);
+});
+
+// runEverything();
